@@ -1,12 +1,14 @@
 from pathlib import Path
-from unittest import case
 
 import yt_dlp
+import requests
 import questionary
-from questionary import ValidationError
+from bs4 import BeautifulSoup
+from questionary import Choice
 
 from metadata import get_metadata, update_metadata, print_metadata
 from src.settings import load_settings, add_directory, remove_directory, DEFAULT_OUT_DIR
+from src.validation import validate_pos_int, validate_pos_float, validate_neg_float
 
 
 def main():
@@ -33,39 +35,53 @@ def main():
                 manage_directories()
 
 
-def manage_directories():
-    action = ""
-    while action != "Exit Submenu":
-        settings = load_settings()
-
-        print("Current Directories:")
-        for d in settings.directories:
-            print(f"  - {d.as_posix()}")
-        print()
-
-        choices = ["Add Directory"]
-        if settings.directories:
-            choices.append("Remove Directory")
-        choices.append("Exit Submenu")
-        action = questionary.select("What do you want to do?", choices=choices).ask()
-        match action:
-            case "Add Directory":
-                new_dir = Path(questionary.text("Enter new directory:").ask())
-                if new_dir in settings.directories:
-                    continue
-                add_directory(new_dir)
-            case "Remove Directory":
-                rm_dir = questionary.select(
-                    "Which directory would you like to remove?",
-                    choices=[*[d.as_posix() for d in settings.directories], "Cancel Operation"],
-                ).ask()
-                if rm_dir == "Cancel Operation":
-                    continue
-                remove_directory(Path(rm_dir))
-
-
 def download():
-    raise NotImplementedError
+    url = questionary.text("Enter URL: ").ask()
+    if not url:
+        return
+    resp = requests.get(url)
+    soup = BeautifulSoup(resp.text, features="html.parser")
+
+    def is_excluded(t: str) -> bool:
+        excluded_title_prefixes = [
+            "Your Browser",
+            "Dein Browser",
+        ]
+        for p in excluded_title_prefixes:
+            if t.startswith(p):
+                return True
+        return False
+    links = soup.find_all(name="title")
+    title = next((link.text for link in links if not is_excluded(link.text)), "?")
+    meta = soup.find_all(name="meta")
+    artist = next((m.attrs.get("content") for m in meta if m.attrs.get("name", "") == "description"), "?")
+    filename = questionary.text("Enter filename:", default=f"{artist} - {title}").ask()
+    if not filename:
+        return
+
+    yt_ops = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'outtmpl': f'out/{filename}.%(ext)s',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'opus',
+            'preferredquality': '0',  # VBR (Variable Bit Rate) highest quality
+        }],
+    }
+
+    start_offset = float(questionary.text("Enter start offset:", default="0", validate=validate_pos_float).ask())
+    end_offset = float(questionary.text("Enter end offset:", default="0", validate=validate_neg_float).ask())
+    if start_offset > 0 or end_offset < 0:
+        yt_ops['download_ranges'] = yt_dlp.utils.download_range_func([], [[start_offset, end_offset]])
+    if start_offset > 0:
+        yt_ops['force_keyframes_at_cuts'] = True
+
+    with yt_dlp.YoutubeDL(yt_ops) as ydl:
+        ydl.download([url])
+
+    filepath = Path(__file__).parent.parent / "out" / f"{filename}.opus"
+    modify_metadata(filepath.as_posix())
 
 
 def modify_metadata(filepath = None):
@@ -134,9 +150,13 @@ def modify_metadata(filepath = None):
                 if 'album' in metadata and 'date' in metadata:
                     albums[metadata["album"][0]] = metadata["date"][0]
 
+            current_metadata = get_metadata(filepath)
+            current_genres = current_metadata.get("genre", [])
+            genre_choices = [Choice(g, checked=g in current_genres) for g in genres]
+
             chosen_genres = ['Other']
             if genres:
-                chosen_genres = questionary.checkbox("Select the genres", choices=[*genres, "Other"]).ask()
+                chosen_genres = questionary.checkbox("Select the genres", choices=[*genre_choices, "Other"]).ask()
             if 'Other' in chosen_genres:
                 chosen_genres.remove('Other')
                 r = questionary.text("Enter genres (comma separated): ").ask()
@@ -145,31 +165,29 @@ def modify_metadata(filepath = None):
 
             changes["genre"] = chosen_genres
 
-            def validate_int(y):
-                if not y:
-                    return True
-                try:
-                    int(y)
-                except:
-                    raise ValidationError(message="Year must be an integer")
-                return True
-
+            current_albums = current_metadata.get("album", [])
+            current_album = current_albums[0] if current_albums else None
             album = "Other"
             if albums:
-                album = questionary.select("Album:", choices=[*albums.keys(), "Other"]).ask()
+                album = questionary.select("Album:", default=current_album, choices=[*albums.keys(), "Other"]).ask()
             if album == "Other":
                 album = questionary.text("Type the album:").ask()
-                date = str(questionary.text("Enter year:", validate=validate_int).ask())
+                date = str(questionary.text("Enter year:", validate=validate_pos_int).ask())
             else:
                 date = str(albums[album])
             changes["album"] = [album] if album else None
             changes["date"] = [date] if date else None
 
-            track_number = str(questionary.text("Enter track number:", validate=validate_int).ask())
+            track_numbers = current_metadata.get('tracknumber', [])
+            track_number = track_numbers[0] if track_numbers else ""
+
+            track_number = str(questionary.text(
+                "Enter track number:", default=track_number, validate=validate_pos_int
+            ).ask())
             changes['tracknumber'] = [track_number] if track_number else None
 
             print("Current metadata:")
-            print_metadata(get_metadata(filepath))
+            print_metadata(current_metadata)
             print("Updates:")
             print_metadata(changes)
 
@@ -183,6 +201,37 @@ def read_metadata():
     choices = [f.as_posix() for f in input_dir_path.iterdir()]
     input_file = questionary.select("Input file:", choices=choices).ask()
     print_metadata(get_metadata(input_file))
+
+
+def manage_directories():
+    action = ""
+    while action != "Exit Submenu":
+        settings = load_settings()
+
+        print("Current Directories:")
+        for d in settings.directories:
+            print(f"  - {d.as_posix()}")
+        print()
+
+        choices = ["Add Directory"]
+        if settings.directories:
+            choices.append("Remove Directory")
+        choices.append("Exit Submenu")
+        action = questionary.select("What do you want to do?", choices=choices).ask()
+        match action:
+            case "Add Directory":
+                new_dir = Path(questionary.text("Enter new directory:").ask())
+                if new_dir in settings.directories:
+                    continue
+                add_directory(new_dir)
+            case "Remove Directory":
+                rm_dir = questionary.select(
+                    "Which directory would you like to remove?",
+                    choices=[*[d.as_posix() for d in settings.directories], "Cancel Operation"],
+                ).ask()
+                if rm_dir == "Cancel Operation":
+                    continue
+                remove_directory(Path(rm_dir))
 
 
 if __name__ == "__main__":
